@@ -1,0 +1,14 @@
+### GET request to example server
+GET https://examples.http-client.intellij.net/get
+    ?generated-in=WebStorm
+
+###
+PATCH http://localhost:3000/api/communications/1
+
+###
+
+###
+
+POST http://localhost:3000/api/users/login
+
+###
