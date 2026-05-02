@@ -25,7 +25,7 @@ const Communications: CollectionConfig = {
   admin: {
     ...collectionUtils.GeneratePreviewConfig(),
     useAsTitle: "subject",
-    defaultColumns: ["subject", "tos"],
+    defaultColumns: ["subject", "tos", "status"],
     group: "Notifications",
     disableDuplicate: true,
     enableRichTextRelationship: false,
@@ -97,10 +97,10 @@ const Communications: CollectionConfig = {
               html,
             };
             promises.push(
-              MailUtils.sendMail(payload, message).catch((e) => {
-                MZingaLogger.Instance?.error(`[Communications:err] ${e}`);
-                return null;
-              }),
+                MailUtils.sendMail(payload, message).catch((e) => {
+                  MZingaLogger.Instance?.error(`[Communications:err] ${e}`);
+                  return null;
+                }),
             );
           }
           await Promise.all(promises.filter((p) => Boolean(p)));
@@ -108,11 +108,11 @@ const Communications: CollectionConfig = {
         } catch (err) {
           if (err.response && err.response.body && err.response.body.errors) {
             err.response.body.errors.forEach((error) =>
-              MZingaLogger.Instance?.error(
-                `[Communications:err]
+                MZingaLogger.Instance?.error(
+                    `[Communications:err]
                 ${error.field}
                 ${error.message}`,
-              ),
+                ),
             );
           } else {
             MZingaLogger.Instance?.error(`[Communications:err] ${err}`);
@@ -151,7 +151,7 @@ const Communications: CollectionConfig = {
           async ({ value, data }) => {
             if (data.sendToAll) {
               const promises = [] as Promise<
-                PaginatedDocs<Record<string, unknown> & TypeWithID>
+                  PaginatedDocs<Record<string, unknown> & TypeWithID>
               >[];
 
               const firstSetOfUsers = await payload.find({
@@ -161,20 +161,20 @@ const Communications: CollectionConfig = {
               const pages = firstSetOfUsers.totalPages;
               for (let i = 1; i < pages; i++) {
                 promises.push(
-                  payload.find({
-                    collection: Slugs.Users,
-                    limit: 100,
-                    page: i,
-                  }),
+                    payload.find({
+                      collection: Slugs.Users,
+                      limit: 100,
+                      page: i,
+                    }),
                 );
               }
               const allDocs = [firstSetOfUsers]
-                .concat(await Promise.all(promises))
-                .map((p) => p.docs)
-                .flat()
-                .map((d) => {
-                  return { relationTo: Slugs.Users, value: d.id };
-                });
+                  .concat(await Promise.all(promises))
+                  .map((p) => p.docs)
+                  .flat()
+                  .map((d) => {
+                    return { relationTo: Slugs.Users, value: d.id };
+                  });
               value = allDocs;
             }
             return value;
@@ -212,6 +212,31 @@ const Communications: CollectionConfig = {
       type: "richText",
       required: true,
     },
+    {
+      name: "status",
+      type: "select",
+      options: [
+        {
+          label: 'Pending - Waiting for worker',
+          value: 'pending',
+        },
+        {
+          label: 'Processing - Worker active',
+          value: 'processing',
+        },
+        {
+          label: 'Sent - All emails dispatched',
+          value: 'sent',
+        },
+        {
+          label: 'Failed - Check logs',
+          value: 'failed',
+        },
+      ],
+      admin: {
+        readOnly: true,
+      }
+    }
   ],
 };
 
