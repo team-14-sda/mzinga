@@ -18,9 +18,7 @@ const Communications: CollectionConfig = {
     delete: () => {
       return false;
     },
-    update: () => {
-      return false;
-    },
+    update: access.GetIsAdmin,
   },
   admin: {
     ...collectionUtils.GeneratePreviewConfig(),
@@ -39,7 +37,6 @@ const Communications: CollectionConfig = {
         if (doc.status === "pending" || doc.status === "sent") {
           return doc;
         }
-
         if (process.env.COMMUNICATIONS_EXTERNAL_WORKER === "true") {
           await payload.update({
             collection: Slugs.Communications,
