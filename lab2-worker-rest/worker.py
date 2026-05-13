@@ -1,15 +1,22 @@
 import os
+import sys
 
 import requests
 from dotenv import load_dotenv
 import time
 import importlib
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 lab1_worker = importlib.import_module("lab1-worker.worker")
 slate_to_html, send_email = lab1_worker.slate_to_html, lab1_worker.send_email
 
 load_dotenv()
 poll_time = int(os.getenv("POLL_INTERVAL_SECONDS"))
-email = os.getenv("MZINGA_EMAIL", "s361334@studenti.polito.it")
+email = os.getenv("MZINGA_EMAIL", "a@a.com")
 password = os.getenv("MZINGA_PASSWORD", "aaa")
 url = os.getenv("MZINGA_URL", "http://localhost:3000")
 
@@ -17,6 +24,7 @@ def login():
     post_url = url + "/api/users/login"
     data = {"email": email, "password": password}
     post_response = requests.post(url=post_url, json=data)
+    print(post_response)
     return post_response.json()["token"]
 
 def authorization_header(token):
@@ -47,15 +55,9 @@ def run_worker():
                     token = login()
                     header = authorization_header(token)
                     continue
-                to_emails = list()
-                cc_emails = list()
-                bcc_emails = list()
-                for to in doc["tos"]:
-                    to_emails.append(to["value"]["email"])
-                for cc in doc["ccs"]:
-                    cc_emails.append(cc["value"]["email"])
-                for bcc in doc["bccs"]:
-                    bcc_emails.append(bcc["value"]["email"])
+                to_emails = [to["value"]["email"] for to in doc.get("tos", [])]
+                cc_emails = [cc["value"]["email"] for cc in doc.get("ccs", [])]
+                bcc_emails = [bcc["value"]["email"] for bcc in doc.get("bccs", [])]
                 try:
                     print(to_emails, cc_emails, bcc_emails)
                     html_content = slate_to_html(doc.get("body"))
@@ -74,3 +76,6 @@ def run_worker():
                         requests.patch(url=patch_processing_url + doc_id, json=status, headers=header)
                     except Exception as e:
                         print("Critical: could not update status to failed." + str(e))
+
+if __name__ == "__main__":
+    run_worker()
