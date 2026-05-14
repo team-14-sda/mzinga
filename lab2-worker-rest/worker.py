@@ -24,7 +24,6 @@ def login():
     post_url = url + "/api/users/login"
     data = {"email": email, "password": password}
     post_response = requests.post(url=post_url, json=data)
-    print(post_response)
     return post_response.json()["token"]
 
 def authorization_header(token):
