@@ -9,11 +9,14 @@ import structlog
 from dotenv import load_dotenv
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.prometheus import PrometheusMetricReader
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import get_tracer
+from prometheus_client import start_http_server
 
 load_dotenv()
 
@@ -25,14 +28,14 @@ SMTP_HOST = os.getenv("SMTP_HOST", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 1025))
 EMAIL_FROM = os.getenv("EMAIL_FROM", "worker@mzinga.io")
 
-SERVICE_NAME_VALUE = "email-worker"
-SERVICE_VERSION_VALUE = 1.0
+SERVICE_NAME_VALUE = os.getenv("OTEL_SERVICE_NAME")
+SERVICE_VERSION_VALUE = "1.0"
 OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-
+PROMETHEUS_PORT = os.getenv("PROMETHEUS_PORT")
 
 
 resource = Resource(attributes={SERVICE_NAME: SERVICE_NAME_VALUE, SERVICE_VERSION_VALUE: SERVICE_VERSION_VALUE})
-otlp_exporter = OTLPSpanExporter(endpoint=f"f{OTLP_ENDPOINT}/v1/traces")
+otlp_exporter = OTLPSpanExporter(endpoint=f"{OTLP_ENDPOINT}/v1/traces")
 processor = BatchSpanProcessor(otlp_exporter)
 provider = TracerProvider(resource=resource)
 provider.add_span_processor(processor)
@@ -41,6 +44,15 @@ RequestsInstrumentor().instrument()
 
 tracer = get_tracer("email-worker")
 
+start_http_server(port=8000)
+metric_reader = PrometheusMetricReader()
+meter_provider = MeterProvider(metric_readers=[metric_reader], resource=resource)
+meter = meter_provider.get_meter("email-worker")
+
+email_processed_total = meter.create_up_down_counter(name="emails_processed_total")
+email_processing_duration = meter.create_histogram(name="email_processing_duration_seconds", unit="s")
+smtp_send_duration = meter.create_histogram(name="smtp_send_duration_seconds")
+worker_poll_total = meter.create_counter(name="worker_poll_total")
 
 structlog.configure(processors=[structlog.processors.JSONRenderer()])
 log = structlog.get_logger()
@@ -118,6 +130,7 @@ def extract_emails(relationship_list: list) -> list[str]:
 def send_email(to_addresses: list[str], subject: str, html: str,
                cc_addresses: list[str] = None, bcc_addresses: list[str] = None):
     with tracer.start_as_current_span("send_email") as span:
+        timer = time.perf_counter()
         span.set_attribute("recipient_count", len(to_addresses)+len(cc_addresses)+len(bcc_addresses))
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -129,11 +142,12 @@ def send_email(to_addresses: list[str], subject: str, html: str,
         all_recipients = to_addresses + (cc_addresses or []) + (bcc_addresses or [])
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
             server.sendmail(EMAIL_FROM, all_recipients, msg.as_string())
-
+            smtp_send_duration.record(time.perf_counter() - timer)
 
 def process(token: str, doc: dict):
     doc_id = doc["id"]
     with tracer.start_as_current_span("process_communication") as span:
+        timer = time.perf_counter()
         span.set_attribute("doc_id", doc_id)
         log.info("Processing communication", service="email-worker", doc_id=doc_id, trace_id=trace.get_current_span().get_span_context().trace_id, span_id=trace.get_current_span().get_span_context().span_id)
         update_status(token, doc_id, "processing")
@@ -149,9 +163,13 @@ def process(token: str, doc: dict):
                 send_email(to_emails, doc["subject"], html, cc_emails, bcc_emails)
                 update_status(token, doc_id, "sent")
                 log.info("Communication sent successfully", service="email-worker", doc_id=doc_id, trace_id=trace.get_current_span().get_span_context().trace_id, span_id=trace.get_current_span().get_span_context().span_id)
+                email_processed_total.add(1, attributes={"status": "sent", "recipient_count": len(to_emails)+len(cc_emails)+len(bcc_emails)})
+                email_processing_duration.record(time.perf_counter() - timer)
         except Exception as e:
             span.set_attribute("status", "ERROR")
             log.error("Failed to process communication", service="email-worker", doc_id=doc_id,trace_id=trace.get_current_span().get_span_context().trace_id, span_id=trace.get_current_span().get_span_context().span_id, error=e)
+            email_processed_total.add(-1, attributes={"status": "failed", "recipient_count": to_emails+cc_emails+bcc_emails})
+            email_processing_duration.record(time.perf_counter() - timer)
             update_status(token, doc_id, "failed")
 
 
@@ -162,8 +180,10 @@ def poll():
         try:
             docs = fetch_pending(token)
             for doc in docs:
+                worker_poll_total.add(1, attributes={"result": "found"})
                 process(token, doc)
             if not docs:
+                worker_poll_total.add(1, attributes={"result": "empty"})
                 time.sleep(POLL_INTERVAL)
         except requests.HTTPError as e:
             if e.response.status_code == 401:
