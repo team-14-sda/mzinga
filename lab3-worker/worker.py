@@ -1,15 +1,14 @@
 import os
-import time
 import smtplib
-import logging
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from dotenv import load_dotenv
+
 import requests
+import structlog
+from dotenv import load_dotenv
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
 
 MZINGA_URL = os.environ["MZINGA_URL"]
 MZINGA_EMAIL = os.environ["MZINGA_EMAIL"]
@@ -19,6 +18,8 @@ SMTP_HOST = os.getenv("SMTP_HOST", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 1025))
 EMAIL_FROM = os.getenv("EMAIL_FROM", "worker@mzinga.io")
 
+structlog.configure(processors=[structlog.processors.JSONRenderer()])
+log = structlog.get_logger()
 
 def login() -> str:
     resp = requests.post(
@@ -26,7 +27,7 @@ def login() -> str:
         json={"email": MZINGA_EMAIL, "password": MZINGA_PASSWORD},
     )
     resp.raise_for_status()
-    log.info("Authenticated with MZinga API")
+    log.info("Getting the token", service="email-worker", doc_id=None)
     return resp.json()["token"]
 
 
@@ -106,7 +107,7 @@ def send_email(to_addresses: list[str], subject: str, html: str,
 
 def process(token: str, doc: dict):
     doc_id = doc["id"]
-    log.info(f"Processing communication {doc_id}")
+    log.info("Processing communication", service="email-worker", doc_id=doc_id)
     update_status(token, doc_id, "processing")
     try:
         to_emails = extract_emails(doc.get("tos"))
@@ -117,15 +118,15 @@ def process(token: str, doc: dict):
         html = slate_to_html(doc.get("body") or [])
         send_email(to_emails, doc["subject"], html, cc_emails, bcc_emails)
         update_status(token, doc_id, "sent")
-        log.info(f"Communication {doc_id} sent successfully")
+        log.info("Communication sent successfully", service="email-worker", doc_id=doc_id)
     except Exception as e:
-        log.error(f"Failed to process communication {doc_id}: {e}")
+        log.error(f"Failed to process communication {e}", service="email-worker", doc_id=doc_id)
         update_status(token, doc_id, "failed")
 
 
 def poll():
     token = login()
-    log.info(f"Worker started. Polling every {POLL_INTERVAL}s")
+    log.info(f"Worker started. Polling every {POLL_INTERVAL}s",  service="email-worker", doc_id=None)
     while True:
         try:
             docs = fetch_pending(token)
@@ -135,10 +136,10 @@ def poll():
                 time.sleep(POLL_INTERVAL)
         except requests.HTTPError as e:
             if e.response.status_code == 401:
-                log.warning("Token expired, re-authenticating")
+                log.warning("Token expired, re-authenticating", service="email-worker", doc_id=None)
                 token = login()
             else:
-                log.error(f"HTTP error: {e}")
+                log.error(f"HTTP error: {e}", service="email-worker", doc_id=None)
                 time.sleep(POLL_INTERVAL)
 
 
