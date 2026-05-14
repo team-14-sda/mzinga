@@ -7,6 +7,13 @@ from email.mime.text import MIMEText
 import requests
 import structlog
 from dotenv import load_dotenv
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.sdk.resources import Resource, SERVICE_NAME
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import get_tracer
 
 load_dotenv()
 
@@ -18,6 +25,23 @@ SMTP_HOST = os.getenv("SMTP_HOST", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 1025))
 EMAIL_FROM = os.getenv("EMAIL_FROM", "worker@mzinga.io")
 
+SERVICE_NAME_VALUE = "email-worker"
+SERVICE_VERSION_VALUE = 1.0
+OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+
+
+resource = Resource(attributes={SERVICE_NAME: SERVICE_NAME_VALUE, SERVICE_VERSION_VALUE: SERVICE_VERSION_VALUE})
+otlp_exporter = OTLPSpanExporter(endpoint=f"f{OTLP_ENDPOINT}/v1/traces")
+processor = BatchSpanProcessor(otlp_exporter)
+provider = TracerProvider(resource=resource)
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+RequestsInstrumentor().instrument()
+
+tracer = get_tracer("email-worker")
+
+
 structlog.configure(processors=[structlog.processors.JSONRenderer()])
 log = structlog.get_logger()
 
@@ -27,7 +51,7 @@ def login() -> str:
         json={"email": MZINGA_EMAIL, "password": MZINGA_PASSWORD},
     )
     resp.raise_for_status()
-    log.info("Getting the token", service="email-worker", doc_id=None)
+    log.info("Getting the token", service="email-worker", doc_id=None, trace_id=None, span_id=None)
     return resp.json()["token"]
 
 
@@ -93,40 +117,47 @@ def extract_emails(relationship_list: list) -> list[str]:
 
 def send_email(to_addresses: list[str], subject: str, html: str,
                cc_addresses: list[str] = None, bcc_addresses: list[str] = None):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = ", ".join(to_addresses)
-    if cc_addresses:
-        msg["Cc"] = ", ".join(cc_addresses)
-    msg.attach(MIMEText(html, "html"))
-    all_recipients = to_addresses + (cc_addresses or []) + (bcc_addresses or [])
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.sendmail(EMAIL_FROM, all_recipients, msg.as_string())
+    with tracer.start_as_current_span("send_email") as span:
+        span.set_attribute("recipient_count", len(to_addresses)+len(cc_addresses)+len(bcc_addresses))
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = ", ".join(to_addresses)
+        if cc_addresses:
+            msg["Cc"] = ", ".join(cc_addresses)
+        msg.attach(MIMEText(html, "html"))
+        all_recipients = to_addresses + (cc_addresses or []) + (bcc_addresses or [])
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.sendmail(EMAIL_FROM, all_recipients, msg.as_string())
 
 
 def process(token: str, doc: dict):
     doc_id = doc["id"]
-    log.info("Processing communication", service="email-worker", doc_id=doc_id)
-    update_status(token, doc_id, "processing")
-    try:
-        to_emails = extract_emails(doc.get("tos"))
-        if not to_emails:
-            raise ValueError("No valid 'to' email addresses found")
-        cc_emails = extract_emails(doc.get("ccs"))
-        bcc_emails = extract_emails(doc.get("bccs"))
-        html = slate_to_html(doc.get("body") or [])
-        send_email(to_emails, doc["subject"], html, cc_emails, bcc_emails)
-        update_status(token, doc_id, "sent")
-        log.info("Communication sent successfully", service="email-worker", doc_id=doc_id)
-    except Exception as e:
-        log.error(f"Failed to process communication {e}", service="email-worker", doc_id=doc_id)
-        update_status(token, doc_id, "failed")
+    with tracer.start_as_current_span("process_communication") as span:
+        span.set_attribute("doc_id", doc_id)
+        log.info("Processing communication", service="email-worker", doc_id=doc_id, trace_id=trace.get_current_span().get_span_context().trace_id, span_id=trace.get_current_span().get_span_context().span_id)
+        update_status(token, doc_id, "processing")
+        try:
+            to_emails = extract_emails(doc.get("tos"))
+            if not to_emails:
+                raise ValueError("No valid 'to' email addresses found")
+            cc_emails = extract_emails(doc.get("ccs"))
+            bcc_emails = extract_emails(doc.get("bccs"))
+            with tracer.start_as_current_span("serialize_body") as s:
+                html = slate_to_html(doc.get("body") or [])
+                s.set_attribute("node_count", len(html))
+                send_email(to_emails, doc["subject"], html, cc_emails, bcc_emails)
+                update_status(token, doc_id, "sent")
+                log.info("Communication sent successfully", service="email-worker", doc_id=doc_id, trace_id=trace.get_current_span().get_span_context().trace_id, span_id=trace.get_current_span().get_span_context().span_id)
+        except Exception as e:
+            span.set_attribute("status", "ERROR")
+            log.error("Failed to process communication", service="email-worker", doc_id=doc_id,trace_id=trace.get_current_span().get_span_context().trace_id, span_id=trace.get_current_span().get_span_context().span_id, error=e)
+            update_status(token, doc_id, "failed")
 
 
 def poll():
     token = login()
-    log.info(f"Worker started. Polling every {POLL_INTERVAL}s",  service="email-worker", doc_id=None)
+    log.info(f"Worker started. Polling every {POLL_INTERVAL}s",  service="email-worker", doc_id=None,trace_id=None, span_id=None)
     while True:
         try:
             docs = fetch_pending(token)
@@ -136,10 +167,10 @@ def poll():
                 time.sleep(POLL_INTERVAL)
         except requests.HTTPError as e:
             if e.response.status_code == 401:
-                log.warning("Token expired, re-authenticating", service="email-worker", doc_id=None)
+                log.warning("Token expired, re-authenticating", service="email-worker", doc_id=None, trace_id=None, span_id=None)
                 token = login()
             else:
-                log.error(f"HTTP error: {e}", service="email-worker", doc_id=None)
+                log.error(f"HTTP error: {e}", service="email-worker", doc_id=None, trace_id=None, span_id=None)
                 time.sleep(POLL_INTERVAL)
 
 
